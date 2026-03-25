@@ -6,7 +6,7 @@ from app.models.attendance import AttendanceModeEnum
 
 class AttendanceBase(BaseModel):
     employee_id: int
-    employee_name: str
+    employee_name: Optional[str] = None
     attendance_date: date
     attendance_time: time
     punch: bool
@@ -80,6 +80,7 @@ class AttendanceRecord(BaseModel):
 class AttendanceSummary(BaseModel):
     present: int
     late: int
+    early: int
     absent: int
     leave: int
     total_days: int

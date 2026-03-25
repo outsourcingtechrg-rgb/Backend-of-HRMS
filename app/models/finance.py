@@ -5,12 +5,13 @@
 # from .base import Base
 
 
-# class Account(Base):
-#     __tablename__ = "accounts"
+# class Finance(Base):
+#     __tablename__ = "finance"
 
 #     id = Column(Integer, primary_key=True, index=True)
-#     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
+#     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
 #     salary = Column(Integer, nullable=True)
+#     Minus = Column(Integer, nullable=True)
 #     account_holder = Column(String(255), nullable=False)
 #     account_number = Column(String(255), nullable=False)
 #     account_bank = Column(String(255), nullable=False)

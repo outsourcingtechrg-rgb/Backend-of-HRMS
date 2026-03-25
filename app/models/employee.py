@@ -116,6 +116,14 @@ class Employee(Base):
     uselist=False,
     )
 
+    # # application
+    applications = relationship(
+        "Application",
+        back_populates="employee",
+        foreign_keys="Application.employee_id",
+    )
+
+    
     # # # Attendance
     # attendances = relationship(
     #     "Attendance",
@@ -123,12 +131,6 @@ class Employee(Base):
     #     cascade="all, delete-orphan",
     # )
 
-    # # Leave
-    # leave_applications = relationship(
-    #     "LeaveApplication",
-    #     back_populates="employee",
-    #     foreign_keys="LeaveApplication.employee_id",
-    # )
 
     # approved_leaves = relationship(
     #     "LeaveApplication",
