@@ -10,7 +10,7 @@ DEVICE_PORT = 4370
 TIMEOUT = 20
 
 # Date + Time filter
-FROM_DATETIME = datetime.strptime("2026-03-19 00:00:00", "%Y-%m-%d %H:%M:%S")
+FROM_DATETIME = datetime.strptime("2026-03-27 00:00:00", "%Y-%m-%d %H:%M:%S")
 
 # ---------------------------
 # Excel setup

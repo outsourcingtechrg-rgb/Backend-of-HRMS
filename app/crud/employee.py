@@ -1,7 +1,9 @@
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from typing import Optional
 from app.models.employee import Employee
+from app.models.department import Department
 from app.schemas.employee import EmployeeCreate, EmployeeUpdate
 from app.models.LoginAccount import LoginAccount
 from app.core.security import hash_password
@@ -45,16 +47,50 @@ def get_employee(db: Session, employee_id: int):
         )
         .first()
     )
+
+
+def get_department_of_employee(db: Session, employee_id: int) -> Optional[int]:
+    """Get the department ID of an employee."""
+    employee = get_employee(db, employee_id)
+    return employee.department_id if employee else None
+
+
+def is_department_head(db: Session, employee_id: int) -> bool:
+    """Check if an employee is a department head."""
+    dept = db.query(Department).filter(Department.head_id == employee_id).first()
+    return dept is not None
+
+
+def get_headed_department_id(db: Session, employee_id: int) -> Optional[int]:
+    """Get the department ID if the employee is a head, otherwise None."""
+    dept = db.query(Department).filter(Department.head_id == employee_id).first()
+    return dept.id if dept else None
  
 
-def get_employees(db: Session, skip: int = 0, limit: int = 100):
-    return (
-        db.query(Employee)
-        .filter(Employee.is_deleted == False)
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
+def get_employees(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    department_id: Optional[int] = None,
+):
+    """
+    Get employees, optionally filtered by department.
+    
+    Args:
+        db: Database session
+        skip: Number of records to skip
+        limit: Maximum number of records to return
+        department_id: If provided, only return employees in this department
+    
+    Returns:
+        List of employees
+    """
+    query = db.query(Employee).filter(Employee.is_deleted == False)
+    
+    if department_id is not None:
+        query = query.filter(Employee.department_id == department_id)
+    
+    return query.offset(skip).limit(limit).all()
 
 
 def update_employee(

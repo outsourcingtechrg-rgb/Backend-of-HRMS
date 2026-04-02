@@ -21,6 +21,7 @@ class EmployeeStatusEnum(str, enum.Enum):
     inactive = "inactive"
     active = "active"
     resigned = "resigned"
+    probation = "probation"
     terminated = "terminated"
 
 
@@ -123,20 +124,12 @@ class Employee(Base):
         foreign_keys="Application.employee_id",
     )
 
-    
-    # # # Attendance
-    # attendances = relationship(
-    #     "Attendance",
-    #     back_populates="employee",
-    #     cascade="all, delete-orphan",
-    # )
-
-
     # approved_leaves = relationship(
     #     "LeaveApplication",
     #     back_populates="approver",
     #     foreign_keys="LeaveApplication.approved_by",
     # )
+
 
     # # KPI
     # kpis = relationship(
