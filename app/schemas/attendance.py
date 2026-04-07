@@ -63,7 +63,7 @@ class AttendanceSyncStatus(BaseModel):
 
 # 🔹 Frontend Attendance Record (Processed)
 class AttendanceRecord(BaseModel):
-    id: int
+    id: Optional[int]  # None for synthesized Absent records
     employee_id: int
     date: str
     status: str  # Present | Late | Absent | Leave

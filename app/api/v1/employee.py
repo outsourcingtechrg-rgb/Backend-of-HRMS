@@ -3,7 +3,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import get_current_user
 from app.crud import employee as employee_crud
 from app.models.employee import Employee
 from app.schemas.employee import (
@@ -46,32 +45,8 @@ def list_employees(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
-    current_user: Employee = Depends(get_current_user),
 ):
-    """
-    Get employees list.
-    
-    If the current user is a department head, only returns employees in their department.
-    Otherwise, admin/other roles see all employees.
-    """
-    # Check if current user is a department head
-    headed_dept_id = employee_crud.get_headed_department_id(db, current_user.id)
-    
-    if headed_dept_id is not None:
-        # User is a department head - filter to their department only
-        return employee_crud.get_employees(
-            db,
-            skip=skip,
-            limit=limit,
-            department_id=headed_dept_id
-        )
-    else:
-        # User is not a department head - return all employees
-        return employee_crud.get_employees(
-            db,
-            skip=skip,
-            limit=limit
-        )
+    return employee_crud.get_employees(db, skip=skip, limit=limit)
 
 
 @router.get("/{employee_id}", response_model=EmployeeRead)

@@ -49,7 +49,7 @@ def authenticate(db: Session, email: str, password: str):
         "sub": str(account.id),
         "EPI": account.employee_id,
         "id": employee.employee_id if employee else None, 
-        "level": level,  # ✅ ONLY THIS IS NEEDED
+        "level": level,
     }
 
     # 🔹 Force password change case

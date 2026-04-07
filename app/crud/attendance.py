@@ -17,20 +17,31 @@ CRITICAL: ID mapping
   employees appear — ex-employees / test entries in ZKT are excluded.
 
 ═══════════════════════════════════════════════════════════════════
-Enriched admin records
+WHY ABSENTS WERE MISSING  (root-cause fix)
 ═══════════════════════════════════════════════════════════════════
-  get_admin_records()  →  List[dict]
-    Each dict = logical AttendanceRecord + employee metadata:
-      employee_name, f_name, l_name, designation,
-      department_id, department_name, employment_status, image
 
-  get_admin_summary()  →  dict
-    Aggregated counts for the whole org (or one employee).
+  The ZKT machine only writes a row when someone punches in or out.
+  A completely absent day produces ZERO rows in the attendance table.
+
+  Old behaviour: _build_records() only iterated over days that had
+  at least one punch, so absent days were invisible.
+
+  Fix: _fill_absent_days() receives the set of "punched dates" and
+  the full calendar range for the requested month. For every working
+  day (Mon–Fri by default, or every day if the employee has no shift
+  info) that has NO punch it synthesises a record:
+
+      { "status": "Absent", "in_time": None, "out_time": None, "hours": None }
+
+  Weekend handling:
+    • If the employee's shift runs Mon–Fri we skip Sat/Sun.
+    • If no shift info is available we mark ALL days Absent (safest).
+    • Public holidays are NOT handled here (no holiday table yet).
 
 ═══════════════════════════════════════════════════════════════════
 Status rules
 ═══════════════════════════════════════════════════════════════════
-  Absent  : no IN punch
+  Absent  : no punch row for that calendar day
   Late    : IN > shift.shift_late_on           (explicit config)
             IN > shift.shift_start + 15 min    (grace fallback)
             IN > 09:15                          (no shift)
@@ -52,11 +63,6 @@ from app.schemas.attendance import AttendanceCreate, AttendanceUpdate
 # ═══════════════════════════════════════════════════════════════════
 
 def _known_machine_ids(db: Session) -> Set[int]:
-    """
-    Set of Employee.employee_id values for non-deleted employees
-    that actually have a machine ID enrolled in ZKT.
-    Used everywhere to exclude ghost/test entries.
-    """
     try:
         from app.models.employee import Employee
         rows = (
@@ -73,27 +79,16 @@ def _known_machine_ids(db: Session) -> Set[int]:
 
 
 def _resolve_machine_id(db: Session, employee_id: int) -> Optional[int]:
-    """
-    Convert whatever the caller passes (Employee.id or Employee.employee_id)
-    to the ZKT machine ID (Employee.employee_id).
-
-    Priority:
-      1. Find by Employee.id  →  return its employee_id (machine ID)
-      2. Find by Employee.employee_id directly  →  return as-is
-      3. Not found  →  return None
-    """
     try:
         from app.models.employee import Employee
 
-        # Try DB primary key first (JWT sends Employee.id)
         emp = db.query(Employee).filter(
             Employee.id == employee_id,
             Employee.is_deleted == False,
         ).first()
         if emp is not None:
-            return emp.employee_id  # may be None if not enrolled in ZKT
+            return emp.employee_id
 
-        # Try as machine ID directly (admin endpoints, ZKT sync)
         emp = db.query(Employee).filter(
             Employee.employee_id == employee_id,
             Employee.is_deleted == False,
@@ -107,7 +102,6 @@ def _resolve_machine_id(db: Session, employee_id: int) -> Optional[int]:
 
 
 def _get_shift_for_machine_id(db: Session, machine_id: int):
-    """Load Shift ORM for the employee with this ZKT machine ID."""
     try:
         from app.models.employee import Employee
         emp = db.query(Employee).filter(
@@ -120,23 +114,6 @@ def _get_shift_for_machine_id(db: Session, machine_id: int):
 
 
 def _load_employee_map(db: Session) -> Dict[int, dict]:
-    """
-    Build machine_id → employee metadata dict for all non-deleted
-    employees that have a machine ID.
-
-    Shape:
-        { machine_id: {
-            "db_id":             int,
-            "f_name":            str,
-            "l_name":            str,
-            "full_name":         str,
-            "designation":       str | None,
-            "department_id":     int | None,
-            "department_name":   str | None,
-            "employment_status": str,
-            "image":             str | None,
-        }}
-    """
     try:
         from app.models.employee import Employee
         from app.models.department import Department
@@ -161,9 +138,11 @@ def _load_employee_map(db: Session) -> Dict[int, dict]:
                 "designation":       emp.designation,
                 "department_id":     emp.department_id,
                 "department_name":   dept_name,
-                "employment_status": emp.employment_status.value
-                                     if hasattr(emp.employment_status, "value")
-                                     else str(emp.employment_status),
+                "employment_status": (
+                    emp.employment_status.value
+                    if hasattr(emp.employment_status, "value")
+                    else str(emp.employment_status)
+                ),
                 "image":             emp.image,
             }
         return result
@@ -172,7 +151,7 @@ def _load_employee_map(db: Session) -> Dict[int, dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# BASIC CRUD  (raw punch rows — unchanged semantics)
+# BASIC CRUD  (raw punch rows)
 # ═══════════════════════════════════════════════════════════════════
 
 def create_attendance(db: Session, data: AttendanceCreate) -> Attendance:
@@ -224,10 +203,6 @@ def get_attendances(
     skip: int = 0,
     limit: int = 100,
 ) -> List[Attendance]:
-    """
-    Raw punch rows.  Always filtered to known employees.
-    employee_id is treated as machine ID when provided.
-    """
     q = db.query(Attendance)
 
     if employee_id is not None:
@@ -237,7 +212,6 @@ def get_attendances(
         if known:
             q = q.filter(Attendance.employee_id.in_(known))
         else:
-            # No known employees → return nothing rather than all raw ZKT data
             return []
 
     if attendance_date:
@@ -310,10 +284,6 @@ def _is_early_by_hours(shift, hours: Optional[float]) -> bool:
 
 
 def _logical_record_date(punch: Attendance, shift) -> date:
-    """
-    For overnight shifts: punches after midnight that fall within the
-    shift's end + 5 h window belong to the previous calendar day.
-    """
     if not shift or not _is_overnight(shift):
         return punch.attendance_date
 
@@ -327,6 +297,97 @@ def _logical_record_date(punch: Attendance, shift) -> date:
     return punch.attendance_date
 
 
+def _is_working_day(d: date, shift) -> bool:
+    """
+    Return True if this calendar date is a working day.
+
+    Rules (simple — no public-holiday table yet):
+      • If the employee has shift info and shift_start is set, we trust
+        that Mon–Fri are working days and Sat/Sun are not.
+        (Most Pakistani / Gulf schedules are Mon–Fri or Sun–Thu; we
+        default to Mon–Fri until a proper schedule model is added.)
+      • If no shift info: mark every calendar day as a working day so we
+        never silently drop absences.  HR can filter weekends on the
+        frontend if needed.
+    """
+    if shift is None:
+        # No shift → mark all days as potentially working
+        return True
+
+    # weekday(): 0=Mon … 6=Sun
+    # Mon–Fri = 0–4  →  Sat(5) and Sun(6) are off by default
+    return d.weekday() < 5
+
+
+# ═══════════════════════════════════════════════════════════════════
+# THE ABSENT-DAY SYNTHESISER  ← this is the key fix
+# ═══════════════════════════════════════════════════════════════════
+
+def _fill_absent_days(
+    existing_records: List[dict],
+    start_date: date,
+    end_date: date,
+    machine_id: int,
+    shift,
+) -> List[dict]:
+    """
+    For every working day in [start_date, end_date] that has NO
+    matching record in existing_records, inject a synthetic Absent entry.
+
+    This is what makes absent days visible.  Without this, only days
+    with at least one ZKT punch ever appear in the output.
+
+    Parameters
+    ----------
+    existing_records : records already built by _build_records()
+    start_date       : first day of the requested range (already clamped to month)
+    end_date         : last day of the requested range
+    machine_id       : ZKT machine ID — used as employee_id in the synthetic record
+    shift            : Shift ORM object or None — used to decide working days
+
+    Returns
+    -------
+    Combined list (existing + absent synthetics), sorted newest-first.
+    """
+    today = datetime.utcnow().date()
+
+    # Build a set of dates we already have records for
+    existing_dates: Set[date] = set()
+    for r in existing_records:
+        try:
+            existing_dates.add(date.fromisoformat(r["date"]))
+        except (ValueError, TypeError):
+            pass
+
+    synthetic: List[dict] = []
+
+    cur = start_date
+    while cur <= end_date:
+        # Don't synthesise absent for today or future dates —
+        # the employee might still punch in.
+        if cur >= today:
+            cur += timedelta(days=1)
+            continue
+
+        if _is_working_day(cur, shift) and cur not in existing_dates:
+            synthetic.append({
+                "id":              None,   # no real DB row
+                "employee_id":     machine_id,
+                "date":            str(cur),
+                "status":          "Absent",
+                "in_time":         None,
+                "out_time":        None,
+                "hours":           None,
+                "note":            None,
+                "attendance_mode": None,
+            })
+
+        cur += timedelta(days=1)
+
+    combined = existing_records + synthetic
+    return sorted(combined, key=lambda x: x["date"], reverse=True)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # CORE: raw punches → logical AttendanceRecord dicts
 # ═══════════════════════════════════════════════════════════════════
@@ -334,7 +395,15 @@ def _logical_record_date(punch: Attendance, shift) -> date:
 def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
     """
     Convert raw ZKT punch rows into logical attendance records.
-    Each record is dated on the IN-punch date.
+    Returns records ONLY for days that have at least one punch.
+    Absent days are added separately by _fill_absent_days().
+
+    Status rules:
+      Absent     : orphan OUT punch only (no IN)
+      Late & Early: arrived late AND left before required hours
+      Late       : arrived after threshold
+      Early      : left before required hours
+      Present    : on time, full hours
     """
     if not punches:
         return []
@@ -343,7 +412,6 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
     threshold   = _late_threshold(shift)
     max_gap_sec = (16 if overnight else 14) * 3600
 
-    # Group by logical work date
     buckets: Dict[date, List[Attendance]] = {}
     for punch in punches:
         d = _logical_record_date(punch, shift)
@@ -385,20 +453,26 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
                 hours = round(secs / 3600, 2)
 
         if inp is None:
-            status = "Absent"
+            status = "Absent"  # orphan OUT punch — visible to HR
         else:
             in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
             threshold_dt = datetime.combine(record_date, threshold)
-            if outp is not None and _is_early_by_hours(shift, hours):
+
+            is_late  = in_dt > threshold_dt
+            is_early = outp is not None and _is_early_by_hours(shift, hours)
+
+            if is_late and is_early:
+                status = "Late & Early"
+            elif is_early:
                 status = "Early"
-            elif in_dt > threshold_dt:
+            elif is_late:
                 status = "Late"
             else:
                 status = "Present"
 
         result.append({
             "id":              anchor.id,
-            "employee_id":     anchor.employee_id,  # machine ID
+            "employee_id":     anchor.employee_id,
             "date":            str(record_date),
             "status":          status,
             "in_time":         in_time.strftime("%H:%M")  if in_time  else None,
@@ -409,7 +483,6 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
         })
 
     return sorted(result, key=lambda x: x["date"], reverse=True)
-
 
 # ═══════════════════════════════════════════════════════════════════
 # USER /me ENDPOINTS
@@ -424,7 +497,9 @@ def get_my_attendance(
     """
     Logical attendance records for the requesting employee.
     employee_id = Employee.id (from JWT).
-    Returns [] if employee has no ZKT enrollment.
+
+    Absent days are now included: every working day in the requested
+    month that has no punch row is synthesised as an Absent record.
     """
     machine_id = _resolve_machine_id(db, employee_id)
     if machine_id is None:
@@ -433,25 +508,43 @@ def get_my_attendance(
     shift     = _get_shift_for_machine_id(db, machine_id)
     overnight = _is_overnight(shift)
 
-    q = db.query(Attendance).filter(Attendance.employee_id == machine_id)
-
+    # Build the canonical date range for the requested month
     if month:
         year, mon  = map(int, month.split("-"))
         last_day   = monthrange(year, mon)[1]
-        start_date = date(year, mon, 1)
-        end_date   = date(year, mon, last_day)
-        if overnight:
-            start_date -= timedelta(days=1)
-            end_date   += timedelta(days=1)
-        q = q.filter(Attendance.attendance_date.between(start_date, end_date))
+        month_start = date(year, mon, 1)
+        month_end   = date(year, mon, last_day)
+
+        # Pad ±1 day for overnight shift boundary
+        fetch_start = month_start - timedelta(days=1) if overnight else month_start
+        fetch_end   = month_end   + timedelta(days=1) if overnight else month_end
+    else:
+        # No month filter — fetch all punches for the employee
+        month_start = fetch_start = None
+        month_end   = fetch_end   = None
+
+    q = db.query(Attendance).filter(Attendance.employee_id == machine_id)
+
+    if fetch_start and fetch_end:
+        q = q.filter(Attendance.attendance_date.between(fetch_start, fetch_end))
 
     raw     = q.all()
     records = _build_records(raw, shift=shift)
 
+    # Clamp back to the requested month (handles overnight boundary records)
     if month:
-        year, mon = map(int, month.split("-"))
-        prefix    = f"{year}-{mon:02d}"
-        records   = [r for r in records if r["date"].startswith(prefix)]
+        prefix  = f"{year}-{mon:02d}"
+        records = [r for r in records if r["date"].startswith(prefix)]
+
+    # ── KEY FIX: inject Absent records for days with no punch ──
+    if month and month_start and month_end:
+        records = _fill_absent_days(
+            existing_records=records,
+            start_date=month_start,
+            end_date=month_end,
+            machine_id=machine_id,
+            shift=shift,
+        )
 
     return records
 
@@ -499,7 +592,6 @@ def get_today_attendance(
         built = _build_records(raw, shift=shift)
         return built[0] if built else None
 
-    # Overnight: post-midnight or within cutoff
     if now_mins <= cutoff_mins:
         raw   = db.query(Attendance).filter(
             Attendance.employee_id == machine_id,
@@ -508,11 +600,9 @@ def get_today_attendance(
         built = _build_records(raw, shift=shift)
         return built[0] if built else None
 
-    # Dead zone between cutoff and shift start
     if cutoff_mins < now_mins < start_mins:
         return None
 
-    # Pre-midnight: shift has just started
     if now_mins >= start_mins:
         raw   = db.query(Attendance).filter(
             Attendance.employee_id == machine_id,
@@ -531,15 +621,18 @@ def get_attendance_summary(
 ) -> dict:
     """
     Monthly summary for one employee (Employee.id from JWT).
+    Absent days are now counted correctly because get_my_attendance
+    includes synthesised Absent records.
     """
     records    = get_my_attendance(db, employee_id, month=month)
     present    = sum(1 for r in records if r["status"] == "Present")
-    late       = sum(1 for r in records if r["status"] == "Late")
-    early      = sum(1 for r in records if r["status"] == "Early")
+    late       = sum(1 for r in records if r["status"] in ("Late", "Late & Early"))
+    early      = sum(1 for r in records if r["status"] in ("Early", "Late & Early"))
     absent     = sum(1 for r in records if r["status"] == "Absent")
     leave      = sum(1 for r in records if r["status"] == "Leave")
     total_days = len(records)
-    rate       = round(((present + late + early) / total_days) * 100, 2) if total_days else 0.0
+    attended   = sum(1 for r in records if r["status"] in ("Present", "Late", "Early", "Late & Early"))
+    rate       = round((attended / total_days) * 100, 2) if total_days else 0.0
 
     return {
         "present":    present,
@@ -556,6 +649,7 @@ def get_attendance_summary(
 # ADMIN ENDPOINTS
 # Work across all system employees (filtered by _known_machine_ids).
 # Records are enriched with employee name / dept / designation.
+# Absent days are synthesised for each employee in scope.
 # ═══════════════════════════════════════════════════════════════════
 
 def get_admin_records(
@@ -568,28 +662,19 @@ def get_admin_records(
     limit: int = 200,
 ) -> List[dict]:
     """
-    Return enriched logical attendance records for admin/HR views.
+    Enriched logical attendance records for admin/HR views.
+    Now includes synthesised Absent rows for days with no punch.
 
-    Filters:
-      month          — "YYYY-MM"  (recommended — large datasets otherwise)
-      employee_db_id — Employee.id (DB PK) to scope to one employee
-      department_id  — filter by department
-      status_filter  — "Present" | "Late" | "Early" | "Absent" | "Leave"
-
-    Returns dicts shaped as AttendanceRecord + employee metadata fields:
-      employee_name, f_name, l_name, designation,
-      department_id, department_name, employment_status, image
-
-    Only employees that exist in the Employee table are included.
-    ZKT ghost entries (machine IDs with no matching employee) are excluded.
+    status_filter behaviour:
+      "Late"  → includes both "Late" and "Late & Early"
+      "Early" → includes both "Early" and "Late & Early"
+      any other value → exact match only
     """
-    # Build employee map (machine_id → metadata) — filters to known employees
     emp_map = _load_employee_map(db)
 
     if not emp_map:
         return []
 
-    # Optional: scope to a single employee
     if employee_db_id is not None:
         machine_id = _resolve_machine_id(db, employee_db_id)
         if machine_id is None or machine_id not in emp_map:
@@ -598,7 +683,6 @@ def get_admin_records(
     else:
         scope_ids = set(emp_map.keys())
 
-    # Optional: scope to a department
     if department_id is not None:
         scope_ids = {
             mid for mid in scope_ids
@@ -608,54 +692,73 @@ def get_admin_records(
     if not scope_ids:
         return []
 
-    # Build date range
-    start_date: Optional[date] = None
-    end_date:   Optional[date] = None
+    # Determine canonical month range
+    month_start: Optional[date] = None
+    month_end:   Optional[date] = None
     if month:
         year, mon  = map(int, month.split("-"))
         last_day   = monthrange(year, mon)[1]
-        start_date = date(year, mon, 1)
-        end_date   = date(year, mon, last_day)
+        month_start = date(year, mon, 1)
+        month_end   = date(year, mon, last_day)
 
-    # Fetch raw punches for all scoped employees
+    # Fetch raw punches — pad ±1 day always (handles overnight across all shifts)
     q = db.query(Attendance).filter(Attendance.employee_id.in_(scope_ids))
-    if start_date and end_date:
-        # Pad ±1 day to capture overnight shift boundary punches
+    if month_start and month_end:
         q = q.filter(
             Attendance.attendance_date.between(
-                start_date - timedelta(days=1),
-                end_date   + timedelta(days=1),
+                month_start - timedelta(days=1),
+                month_end   + timedelta(days=1),
             )
         )
 
     all_punches = q.order_by(Attendance.attendance_date).all()
 
-    # Group punches by machine_id
     by_emp: Dict[int, List[Attendance]] = {}
     for punch in all_punches:
         by_emp.setdefault(punch.employee_id, []).append(punch)
 
-    # Process each employee's punches
+    # Also ensure every scoped employee gets an entry even if they have
+    # zero punches this month (they'll be all-Absent)
+    for mid in scope_ids:
+        by_emp.setdefault(mid, [])
+
+    # Pre-compute which statuses pass the filter so we don't repeat
+    # this logic inside the inner loop.
+    def _status_passes(status: str) -> bool:
+        if not status_filter:
+            return True
+        if status_filter in ("Late", "Early"):
+            return status == status_filter or status == "Late & Early"
+        return status == status_filter
+
     result: List[dict] = []
+
     for machine_id, punches in by_emp.items():
         meta  = emp_map.get(machine_id, {})
         shift = _get_shift_for_machine_id(db, machine_id)
         recs  = _build_records(punches, shift=shift)
 
-        # Filter back to the requested month (IN-punch date)
-        if month:
-            year, mon = map(int, month.split("-"))
-            prefix    = f"{year}-{mon:02d}"
-            recs      = [r for r in recs if r["date"].startswith(prefix)]
+        # Clamp to requested month
+        if month and month_start and month_end:
+            prefix = f"{year}-{mon:02d}"
+            recs   = [r for r in recs if r["date"].startswith(prefix)]
+
+        # ── KEY FIX: inject Absent records for this employee ──
+        if month_start and month_end:
+            recs = _fill_absent_days(
+                existing_records=recs,
+                start_date=month_start,
+                end_date=month_end,
+                machine_id=machine_id,
+                shift=shift,
+            )
 
         for rec in recs:
-            # Apply status filter if requested
-            if status_filter and rec["status"] != status_filter:
+            if not _status_passes(rec["status"]):
                 continue
 
             result.append({
                 **rec,
-                # Employee metadata
                 "employee_name":     meta.get("full_name", f"#{machine_id}"),
                 "f_name":            meta.get("f_name"),
                 "l_name":            meta.get("l_name"),
@@ -667,12 +770,8 @@ def get_admin_records(
                 "employee_db_id":    meta.get("db_id"),
             })
 
-    # Sort: most recent first, then by name
     result.sort(key=lambda x: (x["date"], x.get("employee_name", "")), reverse=True)
-
-    # Paginate
     return result[skip : skip + limit]
-
 
 def get_admin_summary(
     db: Session,
@@ -680,29 +779,20 @@ def get_admin_summary(
     department_id: Optional[int] = None,
 ) -> dict:
     """
-    Organisation-wide (or department-wide) attendance summary for a month.
-
-    Returns:
-      {
-        present, late, early, absent, leave,
-        total_records, total_employees,
-        rate,
-        by_department: [{ department_id, department_name, present, total, rate }]
-      }
-
-    Only covers employees in the Employee table (not ghost ZKT entries).
+    Organisation-wide (or department-wide) attendance summary.
+    Absent counts are now correct because get_admin_records injects absent days.
     """
-    records = get_admin_records(db, month=month, department_id=department_id, limit=10_000)
+    records = get_admin_records(db, month=month, department_id=department_id, limit=50_000)
 
     present  = sum(1 for r in records if r["status"] == "Present")
-    late     = sum(1 for r in records if r["status"] == "Late")
-    early    = sum(1 for r in records if r["status"] == "Early")
+    late     = sum(1 for r in records if r["status"] in ("Late", "Late & Early"))
+    early    = sum(1 for r in records if r["status"] in ("Early", "Late & Early"))
     absent   = sum(1 for r in records if r["status"] == "Absent")
     leave    = sum(1 for r in records if r["status"] == "Leave")
     total    = len(records)
-    rate     = round(((present + late + early) / total) * 100, 2) if total else 0.0
+    attended = sum(1 for r in records if r["status"] in ("Present", "Late", "Early", "Late & Early"))
+    rate     = round((attended / total) * 100, 2) if total else 0.0
 
-    # Per-department breakdown
     dept_map: Dict[Optional[int], dict] = {}
     for r in records:
         did   = r.get("department_id")
@@ -715,7 +805,7 @@ def get_admin_summary(
                 "total":           0,
             }
         dept_map[did]["total"] += 1
-        if r["status"] in ("Present", "Late", "Early"):
+        if r["status"] in ("Present", "Late", "Early", "Late & Early"):
             dept_map[did]["present"] += 1
 
     by_department = []
@@ -726,13 +816,13 @@ def get_admin_summary(
     by_department.sort(key=lambda x: x.get("department_name") or "")
 
     return {
-        "present":          present,
-        "late":             late,
-        "early":            early,
-        "absent":           absent,
-        "leave":            leave,
-        "total_records":    total,
-        "total_employees":  len({r["employee_id"] for r in records}),
-        "rate":             rate,
-        "by_department":    by_department,
+        "present":         present,
+        "late":            late,
+        "early":           early,
+        "absent":          absent,
+        "leave":           leave,
+        "total_records":   total,
+        "total_employees": len({r["employee_id"] for r in records}),
+        "rate":            rate,
+        "by_department":   by_department,
     }
