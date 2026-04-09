@@ -48,6 +48,7 @@ def authenticate(db: Session, email: str, password: str):
     payload = {
         "sub": str(account.id),
         "EPI": account.employee_id,
+        "department_id": employee.department_id if employee else None,
         "id": employee.employee_id if employee else None, 
         "level": level,
     }

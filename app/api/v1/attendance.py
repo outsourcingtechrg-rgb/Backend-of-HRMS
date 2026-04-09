@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.crud import attendance as attendance_crud
 from app.models.attendance import Attendance
+from app.models.employee import Employee
 from app.schemas.attendance import (
     AttendanceCreate,
     AttendanceUpdate,
@@ -53,12 +54,13 @@ router = APIRouter()
 @router.get("/me", response_model=list[AttendanceRecord])
 def my_attendance(
     employee_id: int = Query(..., description="Employee.id from JWT"),
-    month: Optional[str] = Query(None, description="YYYY-MM"),
+    month: Optional[str] = Query(None, description="YYYY-MM (defaults to current month)"),
     db: Session = Depends(get_db),
 ):
     """
     Monthly attendance for the signed-in employee.
-    Returns [] when the employee has no ZKT machine enrollment.
+    Returns absent days for the month if enrolled but no punches.
+    Returns [] only when the employee has no ZKT machine enrollment.
     """
     return attendance_crud.get_my_attendance(
         db=db, employee_id=employee_id, month=month
