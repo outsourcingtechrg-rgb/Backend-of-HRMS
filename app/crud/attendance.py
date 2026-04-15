@@ -282,7 +282,6 @@ def _is_early_by_hours(shift, hours: Optional[float]) -> bool:
         return False
     return int(hours * 3600) < required
 
-
 def _logical_record_date(punch: Attendance, shift) -> date:
     if not shift or not _is_overnight(shift):
         return punch.attendance_date
@@ -393,24 +392,17 @@ def _fill_absent_days(
 # ═══════════════════════════════════════════════════════════════════
 
 def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
-    """
-    Convert raw ZKT punch rows into logical attendance records.
-    Returns records ONLY for days that have at least one punch.
-    Absent days are added separately by _fill_absent_days().
-
-    Status rules:
-      Absent     : orphan OUT punch only (no IN)
-      Late & Early: arrived late AND left before required hours
-      Late       : arrived after threshold
-      Early      : left before required hours
-      Present    : on time, full hours
-    """
     if not punches:
         return []
+
+    from datetime import datetime, date
 
     overnight   = _is_overnight(shift)
     threshold   = _late_threshold(shift)
     max_gap_sec = (16 if overnight else 14) * 3600
+
+    today = date.today()
+    now   = datetime.now()
 
     buckets: Dict[date, List[Attendance]] = {}
     for punch in punches:
@@ -422,12 +414,14 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
 
     for record_date, bucket in buckets.items():
         ordered = sorted(bucket, key=dt_key)
+
         ins  = [p for p in ordered if p.punch is False]
         outs = [p for p in ordered if p.punch is True]
 
         inp  = ins[0] if ins else None
         outp = None
 
+        # ---- OUT selection ----
         if inp is not None:
             in_dt = datetime.combine(inp.attendance_date, inp.attendance_time)
             valid = [
@@ -444,6 +438,7 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
         in_date  = inp.attendance_date  if inp  else None
         out_date = outp.attendance_date if outp else None
 
+        # ---- HOURS ----
         hours: Optional[float] = None
         if in_time and out_time and in_date and out_date:
             dt_in  = datetime.combine(in_date,  in_time)
@@ -452,24 +447,100 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
             if secs > 0:
                 hours = round(secs / 3600, 2)
 
-        if inp is None:
-            status = "Absent"  # orphan OUT punch — visible to HR
-        else:
-            in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
-            threshold_dt = datetime.combine(record_date, threshold)
+        # ===============================
+        # ✅ TODAY LOGIC FIRST (IMPORTANT)
+        # ===============================
+        is_today_record = (
+    record_date == today or
+    (overnight and record_date == today - timedelta(days=1)))
+        if is_today_record:
+            if inp is None and outp is None:
+                status = "Absent"
 
-            is_late  = in_dt > threshold_dt
-            is_early = outp is not None and _is_early_by_hours(shift, hours)
+            elif inp is not None and outp is None:
+                is_late = False
 
-            if is_late and is_early:
-                status = "Late & Early"
-            elif is_early:
-                status = "Early"
-            elif is_late:
+                if shift:
+                    in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                    threshold_dt = datetime.combine(record_date, threshold)
+                    is_late = in_dt > threshold_dt
+
+                # still working?
+                if shift:
+                    shift_start = shift.shift_start_timing
+                    shift_end   = shift.shift_end_timing
+
+                    shift_start_dt = datetime.combine(record_date, shift_start)
+
+                    if _is_overnight(shift):
+                        shift_end_dt = datetime.combine(record_date + timedelta(days=1), shift_end)
+                    else:
+                        shift_end_dt = datetime.combine(record_date, shift_end)
+
+                    if now < shift_end_dt:
+                        status = "Present"
+                    else:
+                        status = "Late & Early" if is_late else "Early"
+                else:
+                    status = "Late & Early" if is_late else "Present"
+                    
+            elif inp is None and outp is not None:
                 status = "Late"
-            else:
-                status = "Present"
 
+            else:
+                # both exist → calculate normally
+                in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                threshold_dt = datetime.combine(record_date, threshold)
+
+                is_late  = in_dt > threshold_dt
+                is_early = _is_early_by_hours(shift, hours)
+
+                if is_late and is_early:
+                    status = "Late & Early"
+                elif is_early:
+                    status = "Early"
+                elif is_late:
+                    status = "Late"
+                else:
+                    status = "Present"
+
+        # ===============================
+        # ✅ PAST DAYS LOGIC
+        # ===============================
+        else:
+            # both missing → Absent
+            if inp is None and outp is None:
+                status = "Absent"
+
+            else:
+                is_late  = False
+                is_early = False
+
+                # ---- LATE CHECK ----
+                if inp is None:
+                    # no IN → definitely late (came but no proper IN)
+                    is_late = True
+                else:
+                    in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                    threshold_dt = datetime.combine(record_date, threshold)
+                    is_late = in_dt > threshold_dt
+
+                # ---- EARLY CHECK ----
+                if outp is None:
+                    # no OUT → definitely early (left without punching out)
+                    is_early = True
+                else:
+                    is_early = _is_early_by_hours(shift, hours)
+
+                # ---- FINAL STATUS ----
+                if is_late and is_early:
+                    status = "Late & Early"
+                elif is_late:
+                    status = "Late"
+                elif is_early:
+                    status = "Early"
+                else:
+                    status = "Present"
         result.append({
             "id":              anchor.id,
             "employee_id":     anchor.employee_id,
@@ -478,12 +549,10 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
             "in_time":         in_time.strftime("%H:%M")  if in_time  else None,
             "out_time":        out_time.strftime("%H:%M") if out_time else None,
             "hours":           hours,
-            "note":            None,
             "attendance_mode": getattr(anchor, "attendance_mode", None),
         })
 
     return sorted(result, key=lambda x: x["date"], reverse=True)
-
 # ═══════════════════════════════════════════════════════════════════
 # USER /me ENDPOINTS
 # employee_id = Employee.id (DB PK from JWT)

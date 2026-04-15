@@ -124,11 +124,17 @@ class Employee(Base):
         foreign_keys="Application.employee_id",
     )
 
-    # approved_leaves = relationship(
-    #     "LeaveApplication",
-    #     back_populates="approver",
-    #     foreign_keys="LeaveApplication.approved_by",
-    # )
+    # Leave requests
+    leave_requests = relationship(
+        "LeaveRequest",
+        back_populates="employee",
+        foreign_keys="LeaveRequest.employee_id",
+    )
+
+    approved_leaves = relationship(
+        "LeaveRequest",
+        foreign_keys="LeaveRequest.approved_by",
+    )
 
 
     # # KPI
