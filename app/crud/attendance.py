@@ -478,7 +478,7 @@ def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
                         shift_end_dt = datetime.combine(record_date, shift_end)
 
                     if now < shift_end_dt:
-                        status = "Present"
+                        status = "Late" if is_late else "Present"
                     else:
                         status = "Late & Early" if is_late else "Early"
                 else:

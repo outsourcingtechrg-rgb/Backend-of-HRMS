@@ -1,3 +1,5 @@
+# to be discarted (this and all it's branches including model, schema, crud, and API) with frothend
+
 from datetime import datetime
 from enum import Enum
 
@@ -60,8 +62,6 @@ class LeaveType(Base):
 
     carry_forward = Column(Boolean, default=False)
     max_carry_forward = Column(Float, default=0)
-
-    leave_cycle_id = Column(ForeignKey("leave_cycles.id"), nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
