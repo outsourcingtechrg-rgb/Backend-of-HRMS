@@ -21,7 +21,7 @@ def get_shift_by_employee_id(db: Session, employee_id: int) -> Shift | None:
     employee = (
         db.query(Employee)
         .options(joinedload(Employee.shift))  # optimize query
-        .filter(Employee.employee_id == employee_id)
+        .filter(Employee.id == employee_id)
         .first()
     )
 

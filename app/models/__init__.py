@@ -7,7 +7,6 @@ from . import (
     employee,
     LoginAccount,
     kpi,
-    leave,
     logs,
     notice,
     policy,
@@ -15,8 +14,7 @@ from . import (
     role,
     shift,
     training,
-    leaves,
-    
+
 )
 
 from .base import Base
