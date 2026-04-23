@@ -1,32 +1,3 @@
-
-"""
-app/models/application.py
-
-Application model — Leave, Travel, Reimbursement requests.
-
-Approval hierarchy
-──────────────────
-  Employee / Intern / Lead
-      ↓  submits to HOD (dept head of their dept) for first-level review
-      ↓  HOD: Approve → goes to HR for final approval
-             Reject  → done (terminal rejection)
-  HR Admin / HR Officer
-      ↓  gives final Approve / Reject
-  CEO / Super Admin
-      ↓  can see and action everything
-
-Status flow
-───────────
-  Pending            → initial state
-  HOD_Approved       → HOD approved; awaiting HR decision
-  HOD_Rejected       → HOD rejected; terminal
-  Approved           → HR gave final approval; terminal
-  Rejected           → HR rejected after HOD approval (or HR direct); terminal
-
-  If the employee has no HOD (department has no head) the application
-  goes directly to Pending and HR picks it up immediately.
-"""
-
 import enum
 
 from sqlalchemy import (

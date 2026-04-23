@@ -124,6 +124,21 @@ class Employee(Base):
         foreign_keys="Application.employee_id",
     )
 
+    # leave modules::::::
+
+    leave_transactions = relationship(
+        "LeaveTransaction",
+        back_populates="employee",
+        foreign_keys="LeaveTransaction.employee_id",
+    )
+
+    # approved_leaves = relationship(
+    #     "LeaveRequest",
+    #     foreign_keys="LeaveRequest.approved_by",
+    #     back_populates="approver",
+    # )
+
+
     # # Leave requests
     # leave_requests = relationship(
     #     "LeaveRequest",

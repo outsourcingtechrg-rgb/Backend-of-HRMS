@@ -1,0 +1,51 @@
+Required Leave APIs
+
+My leaves
+Apply leave → POST /leaves/applications
+Get my applications → GET /leaves/applications/me
+Get single application → GET /leaves/applications/{id}
+Cancel application → POST /leaves/applications/{id}/cancel
+Upload attachment → POST /applications/{id}/attachments
+Get attachments → GET /applications/{id}/attachments
+Download → GET /attachments/{id}/download
+summary
+Get my summary → GET /leaves/summary/me
+
+
+Leave mannagement
+....Applications Management....
+Get all applications → GET /leaves/applications
+Get pending → GET /leaves/applications/pending
+Get by employee → GET /leaves/applications/employee/{id}
+Approve → POST /applications/{id}/approve
+Reject → POST /applications/{id}/reject
+
+....Leave Types....
+Create → POST /leaves/types
+Get all → GET /leaves/types
+Get by cycle → GET /leaves/types/cycle/{id}
+Update → PATCH /leaves/types/{id}
+Delete → DELETE /leaves/types/{id}
+
+....Leave Cycles....
+Create cycle → POST /leaves/cycles
+Get all → GET /leaves/cycles
+Get active → GET /leaves/cycles/active
+Update → PATCH /leaves/cycles/{id}
+Delete → DELETE /leaves/cycles/{id}
+
+Widgets you’ll have:
+>Total leaves taken
+>Pending approvals
+>Approved vs rejected ratio
+>Department usage
+>Monthly trend
+All should come from:
+GET /leaves/dashboard/stats
+
+
+Get employee summary → GET /leaves/summary/employee/{id}
+
+....Attachments....
+View attachments → GET /applications/{id}/attachments
+Download → GET /attachments/{id}/download
