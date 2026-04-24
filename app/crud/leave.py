@@ -8,7 +8,7 @@ from datetime import date, datetime
 from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, status, UploadFile
-from sqlalchemy import func, extract, and_
+from sqlalchemy import func, extract, and_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.Leaves import (
@@ -17,7 +17,9 @@ from app.models.Leaves import (
     LeaveTransaction,
     LeaveAttachment,
     LeaveStatus,
+    GenderSpecific
 )
+from app.models.employee import Employee
 from app.schemas.leave import (
     LeaveCycleCreate,
     LeaveCycleUpdate,
@@ -48,6 +50,18 @@ def _active_cycle(db: Session) -> LeavesCycle:
             detail="No active leave cycle found",
         )
     return cycle
+
+
+def _get_employee(db: Session, employee_id: int) -> Employee:
+    return _get_or_404(db, Employee, employee_id, "Employee")
+
+
+def _leave_type_allowed_for_employee(leave_type: LeaveType, employee: Employee) -> bool:
+    if leave_type.gender_specific == GenderSpecific.ALL:
+        return True
+
+    employee_gender = (employee.gender or "").strip().upper()
+    return employee_gender == leave_type.gender_specific.value
 
 
 def _business_days(start: date, end: date) -> int:
@@ -146,6 +160,16 @@ def get_leave_types_by_cycle(db: Session, cycle_id: int) -> List[LeaveType]:
     return db.query(LeaveType).filter(LeaveType.cycle_id == cycle_id).all()
 
 
+def get_available_leave_types(db: Session, employee_id: int) -> List[LeaveType]:
+    cycle = _active_cycle(db)
+    employee = _get_employee(db, employee_id)
+    return [
+        lt
+        for lt in get_leave_types_by_cycle(db, cycle.id)
+        if _leave_type_allowed_for_employee(lt, employee)
+    ]
+
+
 def update_leave_type(db: Session, type_id: int, payload: LeaveTypeUpdate) -> LeaveType:
     lt = _get_or_404(db, LeaveType, type_id, "Leave type")
     for field, value in payload.model_dump(exclude_none=True).items():
@@ -170,6 +194,13 @@ def apply_leave(
 ) -> LeaveTransaction:
     cycle = _active_cycle(db)
     leave_type = _get_or_404(db, LeaveType, payload.leave_type_id, "Leave type")
+    employee = _get_employee(db, employee_id)
+
+    if not _leave_type_allowed_for_employee(leave_type, employee):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Leave type '{leave_type.name}' is only available to {leave_type.gender_specific.value} employees",
+        )
 
     # Validate dates fall within cycle
     if not (cycle.start_date <= payload.start_date <= cycle.end_date):
@@ -221,14 +252,25 @@ def apply_leave(
 
 
 def get_my_applications(db: Session, employee_id: int) -> List[LeaveTransaction]:
+    employee = _get_employee(db, employee_id)
+    employee_gender = (employee.gender or "").strip().upper()
+
+    filters = [LeaveType.gender_specific == GenderSpecific.ALL]
+    if employee_gender in {"MALE", "FEMALE"}:
+        filters.append(LeaveType.gender_specific == GenderSpecific(employee_gender))
+
     return (
         db.query(LeaveTransaction)
+        .join(LeaveTransaction.leave_type)
+        .join(LeaveTransaction.employee)
         .options(joinedload(LeaveTransaction.leave_type))
-        .filter(LeaveTransaction.employee_id == employee_id)
+        .filter(
+            LeaveTransaction.employee_id == employee_id,
+            or_(*filters),
+        )
         .order_by(LeaveTransaction.requested_at.desc())
         .all()
     )
-
 
 def get_application(db: Session, application_id: int) -> LeaveTransaction:
     tx = (
@@ -398,7 +440,12 @@ def get_attachment(db: Session, attachment_id: int) -> LeaveAttachment:
 
 def get_leave_summary(db: Session, employee_id: int):
     cycle = _active_cycle(db)
-    leave_types = get_leave_types_by_cycle(db, cycle.id)
+    employee = _get_employee(db, employee_id)
+    leave_types = [
+        lt
+        for lt in get_leave_types_by_cycle(db, cycle.id)
+        if _leave_type_allowed_for_employee(lt, employee)
+    ]
 
     summaries = []
     for lt in leave_types:

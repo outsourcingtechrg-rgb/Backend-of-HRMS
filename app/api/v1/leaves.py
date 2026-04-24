@@ -297,6 +297,18 @@ def leave_types_by_cycle(cycle_id: int, db: Session = Depends(get_db)):
     return crud.get_leave_types_by_cycle(db, cycle_id)
 
 
+@router.get(
+    "/types/employees",
+    response_model=List[LeaveTypeOut],
+    summary="Get leave types available to me based on my gender",
+)
+def my_available_leave_types(
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    return crud.get_available_leave_types(db, current_user.id)
+
+
 @router.patch(
     "/types/{type_id}",
     response_model=LeaveTypeOut,
