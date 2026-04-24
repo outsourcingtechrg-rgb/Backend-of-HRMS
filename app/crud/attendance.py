@@ -59,6 +59,67 @@ from app.schemas.attendance import AttendanceCreate, AttendanceUpdate
 
 
 # ═══════════════════════════════════════════════════════════════════
+# LEAVE INTEGRATION
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_approved_leave_dates(db: Session, employee_id: int, start_date: date, end_date: date) -> Set[date]:
+    """
+    Fetch all approved leave dates for an employee within a date range.
+    
+    Parameters
+    ----------
+    db           : database session
+    employee_id  : Employee.id (database PK, NOT machine_id)
+    start_date   : range start (inclusive)
+    end_date     : range end (inclusive)
+    
+    Returns
+    -------
+    Set of dates when the employee is on approved leave.
+    """
+    try:
+        from app.models.Leaves import LeaveTransaction, LeaveStatus
+        
+        leaves = (
+            db.query(LeaveTransaction)
+            .filter(
+                LeaveTransaction.employee_id == employee_id,
+                LeaveTransaction.status == LeaveStatus.APPROVED,
+                LeaveTransaction.start_date <= end_date,
+                LeaveTransaction.end_date >= start_date,
+            )
+            .all()
+        )
+        
+        leave_dates: Set[date] = set()
+        for leave in leaves:
+            current = leave.start_date
+            while current <= leave.end_date:
+                leave_dates.add(current)
+                current += timedelta(days=1)
+        
+        return leave_dates
+    except Exception:
+        return set()
+
+
+def _get_employee_db_id(db: Session, machine_id: int) -> Optional[int]:
+    """
+    Convert machine_id (Employee.employee_id) to Employee.id (database PK).
+    Needed for leave lookups since LeaveTransaction uses Employee.id.
+    """
+    try:
+        from app.models.employee import Employee
+        emp = db.query(Employee).filter(
+            Employee.employee_id == machine_id,
+            Employee.is_deleted == False,
+        ).first()
+        return emp.id if emp else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # EMPLOYEE RESOLUTION
 # ═══════════════════════════════════════════════════════════════════
 
@@ -328,10 +389,13 @@ def _fill_absent_days(
     end_date: date,
     machine_id: int,
     shift,
+    leave_dates: Optional[Set[date]] = None,
 ) -> List[dict]:
     """
     For every working day in [start_date, end_date] that has NO
     matching record in existing_records, inject a synthetic Absent entry.
+    
+    Excludes leave dates — those are already in existing_records.
 
     This is what makes absent days visible.  Without this, only days
     with at least one ZKT punch ever appear in the output.
@@ -343,12 +407,16 @@ def _fill_absent_days(
     end_date         : last day of the requested range
     machine_id       : ZKT machine ID — used as employee_id in the synthetic record
     shift            : Shift ORM object or None — used to decide working days
+    leave_dates      : Set of dates when employee is on approved leave (optional)
 
     Returns
     -------
     Combined list (existing + absent synthetics), sorted newest-first.
     """
     today = datetime.utcnow().date()
+    
+    if leave_dates is None:
+        leave_dates = set()
 
     # Build a set of dates we already have records for
     existing_dates: Set[date] = set()
@@ -368,7 +436,12 @@ def _fill_absent_days(
             cur += timedelta(days=1)
             continue
 
-        if _is_working_day(cur, shift) and cur not in existing_dates:
+        # Skip leave dates and dates we already have records for
+        if cur in leave_dates or cur in existing_dates:
+            cur += timedelta(days=1)
+            continue
+
+        if _is_working_day(cur, shift):
             synthetic.append({
                 "id":              None,   # no real DB row
                 "employee_id":     machine_id,
@@ -387,11 +460,180 @@ def _fill_absent_days(
     return sorted(combined, key=lambda x: x["date"], reverse=True)
 
 
+
 # ═══════════════════════════════════════════════════════════════════
 # CORE: raw punches → logical AttendanceRecord dicts
 # ═══════════════════════════════════════════════════════════════════
 
-def _build_records(punches: List[Attendance], shift=None) -> List[dict]:
+def _build_records(punches: List[Attendance], shift=None, leave_dates: Optional[Set[date]] = None) -> List[dict]:
+    if not punches:
+        return []
+
+    from datetime import datetime, date
+
+    if leave_dates is None:
+        leave_dates = set()
+
+    overnight   = _is_overnight(shift)
+    threshold   = _late_threshold(shift)
+    max_gap_sec = (16 if overnight else 14) * 3600
+
+    today = date.today()
+    now   = datetime.now()
+
+    buckets: Dict[date, List[Attendance]] = {}
+    for punch in punches:
+        d = _logical_record_date(punch, shift)
+        buckets.setdefault(d, []).append(punch)
+
+    result: List[dict] = []
+    dt_key = lambda p: datetime.combine(p.attendance_date, p.attendance_time)
+
+    for record_date, bucket in buckets.items():
+        ordered = sorted(bucket, key=dt_key)
+
+        ins  = [p for p in ordered if p.punch is False]
+        outs = [p for p in ordered if p.punch is True]
+
+        inp  = ins[0] if ins else None
+        outp = None
+
+        # ---- OUT selection ----
+        if inp is not None:
+            in_dt = datetime.combine(inp.attendance_date, inp.attendance_time)
+            valid = [
+                c for c in outs
+                if 0 < (datetime.combine(c.attendance_date, c.attendance_time) - in_dt).total_seconds() <= max_gap_sec
+            ]
+            outp = valid[-1] if valid else None
+        elif outs:
+            outp = outs[-1]
+
+        anchor   = inp or outp
+        in_time  = inp.attendance_time  if inp  else None
+        out_time = outp.attendance_time if outp else None
+        in_date  = inp.attendance_date  if inp  else None
+        out_date = outp.attendance_date if outp else None
+
+        # ---- HOURS ----
+        hours: Optional[float] = None
+        if in_time and out_time and in_date and out_date:
+            dt_in  = datetime.combine(in_date,  in_time)
+            dt_out = datetime.combine(out_date, out_time)
+            secs   = (dt_out - dt_in).total_seconds()
+            if secs > 0:
+                hours = round(secs / 3600, 2)
+
+        # ===============================
+        # ✅ CHECK FOR LEAVE FIRST
+        # ===============================
+        if record_date in leave_dates:
+            status = "Leave"
+        
+        # ===============================
+        # ✅ TODAY LOGIC
+        # ===============================
+        elif (record_date == today or
+              (overnight and record_date == today - timedelta(days=1))):
+            if inp is None and outp is None:
+                status = "Absent"
+
+            elif inp is not None and outp is None:
+                is_late = False
+
+                if shift:
+                    in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                    threshold_dt = datetime.combine(record_date, threshold)
+                    is_late = in_dt > threshold_dt
+
+                # still working?
+                if shift:
+                    shift_start = shift.shift_start_timing
+                    shift_end   = shift.shift_end_timing
+
+                    shift_start_dt = datetime.combine(record_date, shift_start)
+
+                    if _is_overnight(shift):
+                        shift_end_dt = datetime.combine(record_date + timedelta(days=1), shift_end)
+                    else:
+                        shift_end_dt = datetime.combine(record_date, shift_end)
+
+                    if now < shift_end_dt:
+                        status = "Late" if is_late else "Present"
+                    else:
+                        status = "Late & Early" if is_late else "Early"
+                else:
+                    status = "Late & Early" if is_late else "Present"
+                    
+            elif inp is None and outp is not None:
+                status = "Late"
+
+            else:
+                # both exist → calculate normally
+                in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                threshold_dt = datetime.combine(record_date, threshold)
+
+                is_late  = in_dt > threshold_dt
+                is_early = _is_early_by_hours(shift, hours)
+
+                if is_late and is_early:
+                    status = "Late & Early"
+                elif is_early:
+                    status = "Early"
+                elif is_late:
+                    status = "Late"
+                else:
+                    status = "Present"
+
+        # ===============================
+        # ✅ PAST DAYS LOGIC
+        # ===============================
+        else:
+            # both missing → Absent
+            if inp is None and outp is None:
+                status = "Absent"
+
+            else:
+                is_late  = False
+                is_early = False
+
+                # ---- LATE CHECK ----
+                if inp is None:
+                    # no IN → definitely late (came but no proper IN)
+                    is_late = True
+                else:
+                    in_dt        = datetime.combine(inp.attendance_date, inp.attendance_time)
+                    threshold_dt = datetime.combine(record_date, threshold)
+                    is_late = in_dt > threshold_dt
+
+                # ---- EARLY CHECK ----
+                if outp is None:
+                    # no OUT → definitely early (left without punching out)
+                    is_early = True
+                else:
+                    is_early = _is_early_by_hours(shift, hours)
+
+                # ---- FINAL STATUS ----
+                if is_late and is_early:
+                    status = "Late & Early"
+                elif is_late:
+                    status = "Late"
+                elif is_early:
+                    status = "Early"
+                else:
+                    status = "Present"
+        result.append({
+            "id":              anchor.id,
+            "employee_id":     anchor.employee_id,
+            "date":            str(record_date),
+            "status":          status,
+            "in_time":         in_time.strftime("%H:%M")  if in_time  else None,
+            "out_time":        out_time.strftime("%H:%M") if out_time else None,
+            "hours":           hours,
+            "attendance_mode": getattr(anchor, "attendance_mode", None),
+        })
+
+    return sorted(result, key=lambda x: x["date"], reverse=True)
     if not punches:
         return []
 
@@ -569,6 +811,8 @@ def get_my_attendance(
 
     Absent days are now included: every working day in the requested
     month that has no punch row is synthesised as an Absent record.
+    
+    Leave dates are marked as "Leave" status.
     """
     machine_id = _resolve_machine_id(db, employee_id)
     if machine_id is None:
@@ -598,14 +842,20 @@ def get_my_attendance(
         q = q.filter(Attendance.attendance_date.between(fetch_start, fetch_end))
 
     raw     = q.all()
-    records = _build_records(raw, shift=shift)
+    
+    # ── Get approved leave dates for this employee ──
+    leave_dates: Set[date] = set()
+    if month and month_start and month_end:
+        leave_dates = _get_approved_leave_dates(db, employee_id, month_start, month_end)
+    
+    records = _build_records(raw, shift=shift, leave_dates=leave_dates)
 
     # Clamp back to the requested month (handles overnight boundary records)
     if month:
         prefix  = f"{year}-{mon:02d}"
         records = [r for r in records if r["date"].startswith(prefix)]
 
-    # ── KEY FIX: inject Absent records for days with no punch ──
+    # ── KEY FIX: inject Absent records for days with no punch (excluding leaves) ──
     if month and month_start and month_end:
         records = _fill_absent_days(
             existing_records=records,
@@ -613,6 +863,7 @@ def get_my_attendance(
             end_date=month_end,
             machine_id=machine_id,
             shift=shift,
+            leave_dates=leave_dates,
         )
 
     return records
@@ -625,6 +876,7 @@ def get_today_attendance(
     """
     Today's logical record for the requesting employee.
     Returns None when outside shift window or not enrolled.
+    Returns a "Leave" status record if today is an approved leave day.
     employee_id = Employee.id (from JWT).
     """
     machine_id = _resolve_machine_id(db, employee_id)
@@ -639,12 +891,26 @@ def get_today_attendance(
     yesterday = today - timedelta(days=1)
     now_mins  = now.hour * 60 + now.minute
 
+    # ── Check if today is a leave day ──
+    today_leaves = _get_approved_leave_dates(db, employee_id, today, today)
+    if today in today_leaves:
+        return {
+            "id":              None,
+            "employee_id":     machine_id,
+            "date":            str(today),
+            "status":          "Leave",
+            "in_time":         None,
+            "out_time":        None,
+            "hours":           None,
+            "attendance_mode": None,
+        }
+
     if shift is None:
         raw   = db.query(Attendance).filter(
             Attendance.employee_id == machine_id,
             Attendance.attendance_date == today,
         ).all()
-        built = _build_records(raw)
+        built = _build_records(raw, leave_dates=today_leaves)
         return built[0] if built else None
 
     end_mins    = _to_mins(shift.shift_end_timing)
@@ -658,7 +924,7 @@ def get_today_attendance(
             Attendance.employee_id == machine_id,
             Attendance.attendance_date == today,
         ).all()
-        built = _build_records(raw, shift=shift)
+        built = _build_records(raw, shift=shift, leave_dates=today_leaves)
         return built[0] if built else None
 
     if now_mins <= cutoff_mins:
@@ -666,7 +932,7 @@ def get_today_attendance(
             Attendance.employee_id == machine_id,
             Attendance.attendance_date.in_([yesterday, today]),
         ).all()
-        built = _build_records(raw, shift=shift)
+        built = _build_records(raw, shift=shift, leave_dates=today_leaves)
         return built[0] if built else None
 
     if cutoff_mins < now_mins < start_mins:
@@ -677,7 +943,7 @@ def get_today_attendance(
             Attendance.employee_id == machine_id,
             Attendance.attendance_date == today,
         ).all()
-        built = _build_records(raw, shift=shift)
+        built = _build_records(raw, shift=shift, leave_dates=today_leaves)
         return built[0] if built else None
 
     return None
@@ -692,6 +958,7 @@ def get_attendance_summary(
     Monthly summary for one employee (Employee.id from JWT).
     Absent days are now counted correctly because get_my_attendance
     includes synthesised Absent records.
+    Leave days are counted separately.
     """
     records    = get_my_attendance(db, employee_id, month=month)
     present    = sum(1 for r in records if r["status"] == "Present")
@@ -710,6 +977,7 @@ def get_attendance_summary(
         "absent":     absent,
         "leave":      leave,
         "total_days": total_days,
+        "attended":   attended,
         "rate":       rate,
     }
 
